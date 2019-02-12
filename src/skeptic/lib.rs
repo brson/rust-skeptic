@@ -101,18 +101,21 @@ where
         }
     }
 
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let cargo_manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let mut test_dir = PathBuf::from(cargo_manifest_dir.clone());
-    test_dir.push("tests");
-    let mut test_file = PathBuf::from(test_dir.clone());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    let mut test_dir = cargo_manifest_dir.clone();
+    test_dir.push("tests/skeptic");
+    let mut test_file = test_dir.clone();
     test_file.push("skeptic-tests.rs");
 
+    let target_triple = env::var("TARGET").expect("could not get target triple");
+
     let config = Config {
-        out_dir: PathBuf::from(out_dir),
-        root_dir: PathBuf::from(cargo_manifest_dir),
+        out_dir: out_dir,
+        root_dir: cargo_manifest_dir,
         test_file: test_file,
-        target_triple: env::var("TARGET").expect("could not get target triple"),
+        target_triple: target_triple,
         docs: docs,
     };
 

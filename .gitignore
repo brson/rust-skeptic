@@ -1,4 +1,4 @@
 target
 Cargo.lock
 *~
-tests/skeptic-tests.rs
+tests/skeptic/

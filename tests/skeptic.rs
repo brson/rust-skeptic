@@ -1,1 +1,1 @@
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/skeptic-tests.rs"));
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/skeptic/skeptic-tests.rs"));
