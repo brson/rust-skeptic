@@ -6,7 +6,7 @@ extern crate glob;
 extern crate bytecount;
 
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write, Error as IoError};
 use std::mem;
 use std::path::{PathBuf, Path};
@@ -108,8 +108,9 @@ where
     let out_dir = env::var("OUT_DIR").unwrap();
     let cargo_manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
-    let mut out_file = PathBuf::from(out_dir.clone());
-    out_file.push("skeptic-tests.rs");
+    let mut out_file = PathBuf::from(cargo_manifest_dir.clone());
+    out_file.push("tests");
+    out_file.push("skeptic.rs");
 
     let config = Config {
         out_dir: PathBuf::from(out_dir),
@@ -489,6 +490,9 @@ fn create_test_runner(
 }
 
 fn write_if_contents_changed(name: &Path, contents: &str) -> Result<(), IoError> {
+    let out_dir = name.parent().expect("test path name should contain a directory and file");
+    fs::create_dir_all(out_dir)?;
+
     // Can't open in write mode now as that would modify the last changed timestamp of the file
     match File::open(name) {
         Ok(mut file) => {
