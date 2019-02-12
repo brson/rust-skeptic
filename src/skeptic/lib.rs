@@ -77,7 +77,7 @@ pub fn generate_doc_tests<T: Clone>(docs: &[T])
 where
     T: AsRef<Path>,
 {
-    // This shortcut is specifically so examples in skeptic's on
+    // This shortcut is specifically so examples in skeptic's own
     // readme can call this function in non-build.rs contexts, without
     // panicking below.
     if docs.is_empty() {
