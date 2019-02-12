@@ -6,8 +6,8 @@ extern crate glob;
 extern crate bytecount;
 
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, Read, Write, Error as IoError};
+use std::fs::File;
+use std::io::{Read, Error as IoError};
 use std::mem;
 use std::path::{PathBuf, Path};
 use std::collections::HashMap;
@@ -134,7 +134,7 @@ struct Config {
 
 fn run(config: &Config) {
     let tests = extract_tests(config).unwrap();
-    emit_tests(config, tests).unwrap();
+    emit::emit_tests(config, tests).unwrap();
 }
 
 struct Test {
@@ -388,128 +388,137 @@ struct CodeBlockInfo {
     template: Option<String>,
 }
 
-fn emit_tests(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
-    let mut out = String::new();
+mod emit {
 
-    // Test cases use the api from skeptic::rt
-    out.push_str("extern crate skeptic;\n\n");
+    use std::fs::{self, File};
+    use std::io::{self, Read, Write, Error as IoError};
+    use std::path::Path;
+    use super::{Config, DocTestSuite, Test};
 
-    for doc_test in suite.doc_tests {
-        for test in &doc_test.tests {
-            let test_string = {
-                if let Some(ref t) = test.template {
-                    let template = doc_test.templates.get(t).expect(&format!(
-                        "template {} not found for {}",
-                        t,
-                        doc_test.path.display()
-                    ));
-                    create_test_runner(config, &Some(template.to_string()), test)?
-                } else {
-                    create_test_runner(config, &doc_test.old_template, test)?
-                }
-            };
-            out.push_str(&test_string);
-        }
-    }
-    write_if_contents_changed(&config.test_file, &out)
-}
+    pub(in super) fn emit_tests(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
+        let mut out = String::new();
 
-/// Just like Rustdoc, ignore a "#" sign at the beginning of a line of code.
-/// These are commonly an indication to omit the line from user-facing
-/// documentation but include it for the purpose of playground links or skeptic
-/// testing.
-fn clean_omitted_line(line: &str) -> &str {
-    let trimmed = line.trim_left();
+        // Test cases use the api from skeptic::rt
+        out.push_str("extern crate skeptic;\n\n");
 
-    if trimmed.starts_with("# ") {
-        &trimmed[2..]
-    } else if trimmed.trim_right() == "#" {
-        // line consists of single "#" which might not be followed by newline on windows
-        &trimmed[1..]
-    } else {
-        line
-    }
-}
-
-/// Creates the Rust code that this test will be operating on.
-fn create_test_input(lines: &[String]) -> String {
-    lines
-        .iter()
-        .map(|s| clean_omitted_line(s).to_owned())
-        .collect()
-}
-
-fn create_test_runner(
-    config: &Config,
-    template: &Option<String>,
-    test: &Test,
-) -> Result<String, IoError> {
-
-    let template = template.clone().unwrap_or_else(|| String::from("{}"));
-    let test_text = create_test_input(&test.text);
-
-    let mut s: Vec<u8> = Vec::new();
-    if test.ignore {
-        writeln!(s, "#[ignore]")?;
-    }
-    if test.should_panic {
-        writeln!(s, "#[should_panic]")?;
-    }
-
-    writeln!(s, "#[test]\nfn {}() {{", test.name)?;
-    writeln!(
-        s,
-        "    let s = &format!(r####\"{}{}\"####, r####\"{}\"####);",
-        "\n\n",
-        template,
-        test_text
-    )?;
-
-    // if we are not running, just compile the test without running it
-    if test.no_run {
-        writeln!(
-            s,
-            "    skeptic::rt::compile_test(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
-            config.root_dir.to_str().unwrap(),
-            config.out_dir.to_str().unwrap(),
-            config.target_triple
-        )?;
-    } else {
-        writeln!(
-            s,
-            "    skeptic::rt::run_test(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
-            config.root_dir.to_str().unwrap(),
-            config.out_dir.to_str().unwrap(),
-            config.target_triple
-        )?;
-    }
-
-    writeln!(s, "}}")?;
-    writeln!(s, "\n")?;
-
-    Ok(String::from_utf8(s).unwrap())
-}
-
-fn write_if_contents_changed(name: &Path, contents: &str) -> Result<(), IoError> {
-    let out_dir = name.parent().expect("test path name should contain a directory and file");
-    fs::create_dir_all(out_dir)?;
-
-    // Can't open in write mode now as that would modify the last changed timestamp of the file
-    match File::open(name) {
-        Ok(mut file) => {
-            let mut current_contents = String::new();
-            file.read_to_string(&mut current_contents)?;
-            if current_contents == contents {
-                // No change avoid writing to avoid updating the timestamp of the file
-                return Ok(());
+        for doc_test in suite.doc_tests {
+            for test in &doc_test.tests {
+                let test_string = {
+                    if let Some(ref t) = test.template {
+                        let template = doc_test.templates.get(t).expect(&format!(
+                            "template {} not found for {}",
+                            t,
+                            doc_test.path.display()
+                        ));
+                        create_test_runner(config, &Some(template.to_string()), test)?
+                    } else {
+                        create_test_runner(config, &doc_test.old_template, test)?
+                    }
+                };
+                out.push_str(&test_string);
             }
         }
-        Err(ref err) if err.kind() == io::ErrorKind::NotFound => (),
-        Err(err) => return Err(err),
+        write_if_contents_changed(&config.test_file, &out)
     }
-    let mut file = File::create(name)?;
-    file.write_all(contents.as_bytes())?;
-    Ok(())
+
+    /// Just like Rustdoc, ignore a "#" sign at the beginning of a line of code.
+    /// These are commonly an indication to omit the line from user-facing
+    /// documentation but include it for the purpose of playground links or skeptic
+    /// testing.
+    fn clean_omitted_line(line: &str) -> &str {
+        let trimmed = line.trim_left();
+
+        if trimmed.starts_with("# ") {
+            &trimmed[2..]
+        } else if trimmed.trim_right() == "#" {
+            // line consists of single "#" which might not be followed by newline on windows
+            &trimmed[1..]
+        } else {
+            line
+        }
+    }
+
+    /// Creates the Rust code that this test will be operating on.
+    fn create_test_input(lines: &[String]) -> String {
+        lines
+            .iter()
+            .map(|s| clean_omitted_line(s).to_owned())
+            .collect()
+    }
+
+    fn create_test_runner(
+        config: &Config,
+        template: &Option<String>,
+        test: &Test,
+    ) -> Result<String, IoError> {
+
+        let template = template.clone().unwrap_or_else(|| String::from("{}"));
+        let test_text = create_test_input(&test.text);
+
+        let mut s: Vec<u8> = Vec::new();
+        if test.ignore {
+            writeln!(s, "#[ignore]")?;
+        }
+        if test.should_panic {
+            writeln!(s, "#[should_panic]")?;
+        }
+
+        writeln!(s, "#[test]\nfn {}() {{", test.name)?;
+        writeln!(
+            s,
+            "    let s = &format!(r####\"{}{}\"####, r####\"{}\"####);",
+            "\n\n",
+            template,
+            test_text
+        )?;
+
+        // if we are not running, just compile the test without running it
+        if test.no_run {
+            writeln!(
+                s,
+                "    skeptic::rt::compile_test(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
+                config.root_dir.to_str().unwrap(),
+                config.out_dir.to_str().unwrap(),
+                config.target_triple
+            )?;
+        } else {
+            writeln!(
+                s,
+                "    skeptic::rt::run_test(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
+                config.root_dir.to_str().unwrap(),
+                config.out_dir.to_str().unwrap(),
+                config.target_triple
+            )?;
+        }
+
+        writeln!(s, "}}")?;
+        writeln!(s, "\n")?;
+
+        Ok(String::from_utf8(s).unwrap())
+    }
+
+    fn write_if_contents_changed(name: &Path, contents: &str) -> Result<(), IoError> {
+        let out_dir = name.parent().expect("test path name should contain a directory and file");
+        fs::create_dir_all(out_dir)?;
+
+        // Can't open in write mode now as that would modify the last changed timestamp of the file
+        match File::open(name) {
+            Ok(mut file) => {
+                let mut current_contents = String::new();
+                file.read_to_string(&mut current_contents)?;
+                if current_contents == contents {
+                    // No change avoid writing to avoid updating the timestamp of the file
+                    return Ok(());
+                }
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::NotFound => (),
+            Err(err) => return Err(err),
+        }
+        let mut file = File::create(name)?;
+        file.write_all(contents.as_bytes())?;
+        Ok(())
+    }
+
 }
 
 pub mod rt {
