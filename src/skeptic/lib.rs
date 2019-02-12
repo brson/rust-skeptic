@@ -107,15 +107,16 @@ where
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let cargo_manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-
-    let mut out_file = PathBuf::from(cargo_manifest_dir.clone());
-    out_file.push("tests");
-    out_file.push("skeptic.rs");
+    let mut test_dir = PathBuf::from(cargo_manifest_dir.clone());
+    test_dir.push("tests");
+    let mut test_file = PathBuf::from(test_dir.clone());
+    test_file.push("tests");
+    test_file.push("skeptic.rs");
 
     let config = Config {
         out_dir: PathBuf::from(out_dir),
         root_dir: PathBuf::from(cargo_manifest_dir),
-        out_file: out_file,
+        test_file: test_file,
         target_triple: env::var("TARGET").expect("could not get target triple"),
         docs: docs,
     };
@@ -126,7 +127,7 @@ where
 struct Config {
     out_dir: PathBuf,
     root_dir: PathBuf,
-    out_file: PathBuf,
+    test_file: PathBuf,
     target_triple: String,
     docs: Vec<String>,
 }
@@ -410,7 +411,7 @@ fn emit_tests(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
             out.push_str(&test_string);
         }
     }
-    write_if_contents_changed(&config.out_file, &out)
+    write_if_contents_changed(&config.test_file, &out)
 }
 
 /// Just like Rustdoc, ignore a "#" sign at the beginning of a line of code.
