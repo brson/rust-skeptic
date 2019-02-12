@@ -390,7 +390,7 @@ fn emit_tests(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
     let mut out = String::new();
 
     // Test cases use the api from skeptic::rt
-    out.push_str("extern crate skeptic;\n");
+    out.push_str("extern crate skeptic;\n\n");
 
     for doc_test in suite.doc_tests {
         for test in &doc_test.tests {
@@ -454,11 +454,11 @@ fn create_test_runner(
         writeln!(s, "#[should_panic]")?;
     }
 
-    writeln!(s, "#[test] fn {}() {{", test.name)?;
+    writeln!(s, "#[test]\nfn {}() {{", test.name)?;
     writeln!(
         s,
         "    let s = &format!(r####\"{}{}\"####, r####\"{}\"####);",
-        "\n",
+        "\n\n",
         template,
         test_text
     )?;
@@ -483,7 +483,7 @@ fn create_test_runner(
     }
 
     writeln!(s, "}}")?;
-    writeln!(s, "")?;
+    writeln!(s, "\n")?;
 
     Ok(String::from_utf8(s).unwrap())
 }
