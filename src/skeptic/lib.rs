@@ -110,8 +110,7 @@ where
     let mut test_dir = PathBuf::from(cargo_manifest_dir.clone());
     test_dir.push("tests");
     let mut test_file = PathBuf::from(test_dir.clone());
-    test_file.push("tests");
-    test_file.push("skeptic.rs");
+    test_file.push("skeptic-tests.rs");
 
     let config = Config {
         out_dir: PathBuf::from(out_dir),
