@@ -405,6 +405,16 @@ mod emit {
     use super::{Config, DocTestSuite, Test};
 
     pub (in super) fn emit_tests(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
+        emit_test_cases(config, suite)?;
+        // Emit_test_projects(config, suite)?;
+        Ok(())
+    }
+
+    fn emit_test_cases(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
+        panic!()
+    }
+
+    fn emit_test_projects(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
         let mut out = String::new();
 
         // Test cases use the api from skeptic::rt
