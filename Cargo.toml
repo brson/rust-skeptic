@@ -8,11 +8,8 @@ build = "build.rs"
 [build-dependencies.skeptic]
 path = "src/skeptic"
 
-# This is needed for the tests created by the buildscript
-[dev-dependencies.skeptic]
-path = "src/skeptic"
-
 # This makes the tests that link to Skeptic in README.md work.
 # It is not needed for normal uses of Skeptic.
 [dependencies.skeptic]
 path = "src/skeptic"
+

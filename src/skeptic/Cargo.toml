@@ -21,15 +21,12 @@ tempdir = "0.3"
 glob = "0.2"
 walkdir = "2.2"
 serde_json = "1.0"
+toml = "0.4.10"
 cargo_metadata = "0.6"
 bytecount = "0.4"
 
 [dev-dependencies]
 unindent = "0.1"
-
-[dependencies.error-chain]
-version = "0.12"
-default-features = false
 
 [dependencies.pulldown-cmark]
 version = "0.2"

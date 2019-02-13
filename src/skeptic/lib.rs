@@ -1,13 +1,14 @@
-#[macro_use]
-extern crate error_chain;
 extern crate pulldown_cmark as cmark;
 extern crate tempdir;
 extern crate glob;
 extern crate bytecount;
+extern crate toml;
 
 use std::env;
+use std::error::Error as StdError;
 use std::path::{PathBuf, Path};
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
+use toml::Value;
 
 /// Returns a list of markdown files under a directory.
 ///
@@ -101,33 +102,173 @@ where
         }
     }
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("could not get OUTDIR"));
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("could_not_get CARGO_MANIFEST_DIR"));
+    let target_triple = env::var("TARGET").expect("could not get TARGET");
+
+    // TODO: I'm skeptical of using this value because it is the actual cargo bin,
+    // in the toolchain, and not the rustup wrapper.
+    // TODO: Should we also use RUSTC_WRAPPER?
+    let cargo = env::var("CARGO").expect("could not get CARGO");
+    let rustc = env::var("RUSTC").expect("could not get RUSTC");
 
     let mut test_dir = cargo_manifest_dir.clone();
     test_dir.push("tests/skeptic");
     let mut test_file = test_dir.clone();
     test_file.push("skeptic-tests.rs");
 
-    let target_triple = env::var("TARGET").expect("could not get target triple");
+    let (target_dir, out_dir_has_triple) = target_dir_from_out_dir(&out_dir, &target_triple);
+
+    let manifest_info = extract_manifest_info(&cargo_manifest_dir)
+        .expect("unable to parse manifest for skeptic test generation");
 
     let config = Config {
-        out_dir: out_dir,
         root_dir: cargo_manifest_dir,
+        test_dir: test_dir,
         test_file: test_file,
+        target_dir: target_dir,
         target_triple: target_triple,
+        out_dir_has_triple: out_dir_has_triple,
+        cargo: cargo,
+        rustc: rustc,
         docs: docs,
+        manifest_info: manifest_info,
     };
 
     run(&config);
 }
 
+/// Derive target_dir from out_dir. Hope this is correct...
+///
+/// Two cases:
+///
+/// - $target_dir/(debug|release)/build/$(root_project_name)-$hash/out/
+/// - $target_dir/$target_triple/(debug|release)/build/$(root_project_name)-$hash/out/
+///
+fn target_dir_from_out_dir(out_dir: &Path, target_triple: &str) -> (PathBuf, bool) {
+
+    let mut target_dir = out_dir.to_owned();
+
+    assert!(target_dir.ends_with("out"));
+    assert!(target_dir.pop());
+    assert!(target_dir.pop());
+    assert!(target_dir.ends_with("build"));
+    assert!(target_dir.pop());
+    assert!(target_dir.ends_with("debug") || target_dir.ends_with("release"));
+    assert!(target_dir.pop());
+
+    if target_dir.ends_with(target_triple) {
+        assert!(target_dir.pop());
+        (target_dir, true)
+    } else {
+        (target_dir, false)
+    }
+}
+
+fn extract_manifest_info(manifest_dir: &Path) -> Result<ManifestInfo, Box<StdError + Sync + Send + 'static>> {
+
+    use std::fs::File;
+    use std::io::Read;
+    use toml::Value;
+
+    let mut manifest = manifest_dir.to_owned();
+    manifest.push("Cargo.toml");
+
+    let mut manifest_buf = String::new();
+
+    File::open(manifest)?.read_to_string(&mut manifest_buf)?;
+
+    let mani_value = manifest_buf.parse::<Value>()?;
+
+    let mut deps = None;
+    let mut dev_deps = None;
+    let mut build_deps = None;
+
+    if let Value::Table(sections) = mani_value {
+        for (sec_key, sec_value) in sections {
+            match sec_key.as_str() {
+                "dependencies" => {
+                    deps = Some(sanitize_deps(sec_value));
+                }
+                "dev-dependencies" => {
+                    dev_deps = Some(sanitize_deps(sec_value));
+                }
+                "build-dependencies" => {
+                    build_deps = Some(sanitize_deps(sec_value));
+                }
+                _ => { }
+            }
+        }
+    } else {
+        panic!("unexpected toml type in manifest {:?}", mani_value);
+    }
+
+    Ok(ManifestInfo {
+        deps, dev_deps, build_deps,
+    })
+}
+
+fn sanitize_deps(toml: Value) -> Value {
+    if let Value::Table(deps) = toml {
+        let mut new_deps = BTreeMap::new();
+
+        for (name, props) in deps {
+            if let Value::Table(props) = props {
+                let mut new_props = BTreeMap::new();
+
+                for (prop_name, prop_value) in props {
+                    if prop_name == "path" {
+                        if let Value::String(prop_value) = prop_value {
+                            let path = PathBuf::from(&prop_value);
+                            if !path.is_absolute() {
+                                // rewrite dependency paths to account for the location
+                                // of the test manifest, "tests/skeptic/$test_name/"
+                                // FIXME: This only works 
+                                let mut prop_value = format!("../../../{}", prop_value);
+                                new_props.insert(prop_name, Value::String(prop_value));
+                            } else {
+                                new_props.insert(prop_name, Value::String(prop_value));
+                            }
+                        } else {
+                            new_props.insert(prop_name, prop_value);
+                        }
+                    } else {
+                        new_props.insert(prop_name, prop_value);
+                    }
+                }
+
+                new_deps.insert(name, Value::Table(new_props));
+            } else if let Value::String(s) = props {
+                new_deps.insert(name, Value::String(s));
+            } else {
+                panic!("dep props are not a table or string: {:?}", props);
+            }
+        }
+
+        Value::Table(new_deps)
+    } else {
+        panic!("deps are not a table");
+    }
+}
+
 struct Config {
-    out_dir: PathBuf,
     root_dir: PathBuf,
+    test_dir: PathBuf,
     test_file: PathBuf,
+    target_dir: PathBuf,
     target_triple: String,
+    out_dir_has_triple: bool,
+    cargo: String,
+    rustc: String,
     docs: Vec<String>,
+    manifest_info: ManifestInfo,
+}
+
+#[derive(Debug)]
+struct ManifestInfo {
+    deps: Option<Value>,
+    dev_deps: Option<Value>,
+    build_deps: Option<Value>,
 }
 
 fn run(config: &Config) {
@@ -398,46 +539,472 @@ mod extract {
 }
 
 mod emit {
+#![allow(warnings)] // todo
 
+    use std::collections::{BTreeMap, VecDeque};
+    use std::error::Error as StdError;
+    use std::fmt::Write;
     use std::fs::{self, File};
-    use std::io::{self, Read, Write, Error as IoError};
+    use std::io::{self, Read, Error as IoError};
     use std::path::Path;
-    use super::{Config, DocTestSuite, Test};
+    use super::{Config, DocTestSuite, DocTest, Test, ManifestInfo};
+    use toml::Value;
 
-    pub (in super) fn emit_tests(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
-        emit_test_cases(config, suite)?;
-        // Emit_test_projects(config, suite)?;
+    pub (in super) fn emit_tests(config: &Config, suite: DocTestSuite) -> Result<(), Box<StdError + Send + Sync + 'static>> {
+        emit_test_cases(config, &suite)?;
+        emit_test_projects(config, &suite)?;
+        emit_supercrate_project(config, &suite)?;
         Ok(())
     }
 
-    fn emit_test_cases(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
-        panic!()
-    }
+    fn emit_test_cases(config: &Config, suite: &DocTestSuite) -> Result<(), IoError> {
+        let mut buf = String::new();
 
-    fn emit_test_projects(config: &Config, suite: DocTestSuite) -> Result<(), IoError> {
-        let mut out = String::new();
+        writeln!(buf, "use std::process::Command;");
+        writeln!(buf);
 
-        // Test cases use the api from skeptic::rt
-        out.push_str("extern crate skeptic;\n\n");
+        for test_doc in &suite.doc_tests {
+            for test in &test_doc.tests {
+                let mut s = String::new();
 
-        for doc_test in suite.doc_tests {
-            for test in &doc_test.tests {
-                let test_string = {
-                    if let Some(ref t) = test.template {
-                        let template = doc_test.templates.get(t).expect(&format!(
-                            "template {} not found for {}",
-                            t,
-                            doc_test.path.display()
-                        ));
-                        create_test_runner(config, &Some(template.to_string()), test)?
-                    } else {
-                        create_test_runner(config, &doc_test.old_template, test)?
-                    }
-                };
-                out.push_str(&test_string);
+                if test.ignore { writeln!(s, "/* skeptic-ignored test"); }
+
+                if test.no_run { writeln!(s, "// skeptic-no_run test"); }
+
+                if test.should_panic { writeln!(s, "#[should_panic]"); }
+
+                writeln!(s, "#[test]");
+                writeln!(s, "fn {}() {{", test.name);
+
+                // todo: --release, --nocapture
+                
+                writeln!(s, r#"    let mut cmd = Command::new("{}");"#, config.cargo);
+                writeln!(s, r#"    cmd"#);
+                writeln!(s, r#"        .env("RUSTC", "{}")"#, config.rustc);
+                // ... shhhhhh ...
+                writeln!(s, r#"        .env("RUSTC_BOOTSTRAP", "1")"#);
+                if !test.no_run {
+                    writeln!(s, r#"        .arg("run")"#);
+                } else {
+                    writeln!(s, r#"        .arg("build")"#);
+                }
+                writeln!(s, r#"        .arg("--target-dir={}")"#, config.target_dir.display());
+                if config.out_dir_has_triple {
+                    writeln!(s, r#"        .arg("--target={}")"#, config.target_triple);
+                }
+                if !test.no_run {
+                    write!(s, r#"        .arg("--manifest-path={}/{}/{}")"#, config.test_dir.display(), "master_skeptic", "Cargo.toml");
+                } else {
+                    write!(s, r#"        .arg("--manifest-path={}/{}/{}")"#, config.test_dir.display(), test.name, "Cargo.toml");
+                }
+                writeln!(s, r#"        .arg("-Zunstable-options")"#);
+                //writeln!(s, r#"        .arg("-Zoffline")"#);
+                if !test.no_run {
+                    writeln!(s);
+                    writeln!(s, r#"        .arg("--")"#);
+                    writeln!(s, r#"        .arg("{}");"#, test.name);
+                } else {
+                    writeln!(s, r#";"#);
+                }
+                writeln!(s);
+
+                writeln!(s, r#"    let res = cmd.status()"#);
+                writeln!(s, r#"        .expect("cargo failed to run for test {}");"#, test.name);
+                writeln!(s);
+
+                writeln!(s, r#"    if !res.success() {{"#);
+                if !test.no_run {
+                    writeln!(s, r#"        panic!("cargo run {} failed")"#, test.name);
+                } else {
+                    writeln!(s, r#"        panic!("cargo build {} failed")"#, test.name);
+                }
+                writeln!(s, r#"    }}"#);
+
+                writeln!(s, "}}"); // 'fn' closer
+
+                if test.ignore { writeln!(s, "*/"); }
+
+                writeln!(buf, "{}", s);
+                writeln!(buf);
             }
         }
-        write_if_contents_changed(&config.test_file, &out)
+
+        fs::create_dir_all(&config.test_dir)?;
+
+        write_if_contents_changed(&config.test_file, &buf)?;
+
+        Ok(())
+    }
+
+    fn emit_test_projects(config: &Config, suite: &DocTestSuite) -> Result<(), Box<StdError + Send + Sync + 'static>> {
+        for test_doc in &suite.doc_tests {
+            for test in &test_doc.tests {
+                emit_test_project(config, test_doc, test)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn emit_test_project(config: &Config, test_doc: &DocTest, test: &Test) -> Result<(), Box<StdError + Send + Sync + 'static>> {
+        let test_name = &test.name;
+        let test_src = build_test_src(&test_doc, &test);
+
+        emit_project(&config.test_dir, test_name, &test_src,
+                     &config.manifest_info, LibOrBin::Lib)
+    }
+
+    fn emit_project(test_dir: &Path, test_name: &str, test_src: &str,
+                    manifest_info: &ManifestInfo, lib_bin: LibOrBin) -> Result<(), Box<StdError + Send + Sync + 'static>> {
+
+        let mut test_dir = test_dir.to_owned();
+        test_dir.push(test_name.to_string());
+
+        let mut test_manifest = test_dir.clone();
+        test_manifest.push("Cargo.toml");
+
+        let mut test_src_file = test_dir.clone();
+        test_src_file.push("test.rs");
+
+        let manifest = build_manifest(manifest_info, &test_name, lib_bin);
+        let manifest_str = toml::to_string_pretty(&manifest)?;
+
+        fs::create_dir_all(&test_dir)?;
+
+        write_if_contents_changed(&test_manifest, &manifest_str)?;
+        write_if_contents_changed(&test_src_file, test_src)?;
+
+        Ok(())
+    }
+
+    #[derive(Eq, PartialEq)]
+    enum LibOrBin { Lib, Bin }
+
+    fn build_manifest(info: &ManifestInfo, test_name: &str, lib_bin: LibOrBin) -> Value {
+        let mut toml_map = BTreeMap::new();
+
+        // insert sections inherited from the doc project
+        {
+            if let Some(ref deps) = info.deps {
+                toml_map.insert("dependencies".to_string(), deps.to_owned());
+            }
+            if let Some(ref deps) = info.dev_deps {
+                toml_map.insert("dev-dependencies".to_string(), deps.to_owned());
+            }
+            if let Some(ref deps) = info.build_deps {
+                toml_map.insert("build-dependencies".to_string(), deps.to_owned());
+            }
+        }
+
+        // insert 'lib' section
+        if lib_bin == LibOrBin::Lib {
+            let mut test_map = BTreeMap::new();
+
+            test_map.insert("name".to_string(), Value::String(test_name.to_string()));
+            test_map.insert("path".to_string(), Value::String("test.rs".to_string()));
+
+            toml_map.insert("lib".to_string(), Value::Table(test_map));
+        }
+
+        // insert 'bin' section
+        if lib_bin == LibOrBin::Bin {
+            let mut test_map = BTreeMap::new();
+
+            test_map.insert("name".to_string(), Value::String(test_name.to_string()));
+            test_map.insert("path".to_string(), Value::String("test.rs".to_string()));
+
+            toml_map.insert("bin".to_string(), Value::Array(vec![Value::Table(test_map)]));
+        }
+
+        // insert 'project' section
+        {
+            let mut proj_map = BTreeMap::new();
+
+            proj_map.insert("name".to_string(), Value::String(test_name.to_string()));
+            proj_map.insert("version".to_string(), Value::String("0.0.0".to_string()));
+            proj_map.insert("authors".to_string(), Value::Array(vec![Value::String("rust-skeptic".to_string())]));
+
+            toml_map.insert("project".to_string(), Value::Table(proj_map));
+        }
+
+        Value::Table(toml_map)
+    }
+
+    fn build_test_src(test_doc: &DocTest, test: &Test) -> String {
+        let template = get_template(test_doc, test);
+        let test_text = create_test_input(&test.text);
+        let s = compose_template(&template, test_text);
+
+        let mut s = format!("#![feature(termination_trait_lib)] // skeptic\n\n{}", s);
+
+        writeln!(s);
+        writeln!(s, r#"pub fn __skeptic_main() -> i32 {{"#);
+        writeln!(s, r#"    use std::process::Termination;"#);
+        writeln!(s, r#"    let r = main();"#);
+        writeln!(s, r#"    let exit_code = r.report();"#);
+        writeln!(s, r#"    if exit_code != 0 {{"#);
+        writeln!(s, r#"        println!("{{:#?}}", r);"#);
+        writeln!(s, r#"    }}"#);
+        writeln!(s, r#"    exit_code"#);
+        writeln!(s, r#"}}"#);
+
+        s
+    }
+
+    fn get_template(test_doc: &DocTest, test: &Test) -> Option<String> {
+        if let Some(ref t) = test.template {
+            let template = test_doc.templates.get(t).expect(&format!(
+                "template {} not found for {}",
+                t,
+                test_doc.path.display()
+            ));
+            Some(template.to_string())
+        } else {
+            test_doc.old_template.clone()
+        }
+    }
+
+    // This is a hacky re-implementation of format! for runtime. It's not
+    // going to be particularly reliable, and it only interprets "{ *}".
+    // FIXME: This doesn't handle string literals that contain braces
+    // TODO: Someday replace skeptic's templates with handlebars.
+    fn compose_template(template: &Option<String>, test: String) -> String {
+
+        fn is_odd(fuck_std_for_not_having_obvious_functions: usize) -> bool {
+            let n = fuck_std_for_not_having_obvious_functions;
+            !(n % 2 == 0)
+        }
+        
+        if let Some(ref template) = template {
+            enum State {
+                Nothin,
+                OpenBraceRun(Vec<usize>),
+                Opener(usize),
+                CloseBraceRun(Vec<usize>),
+                CloseBraceRunWithOpener(usize, Vec<usize>),
+            }
+
+            let mut open_brace_runs = vec![];
+            let mut close_brace_runs = vec![];
+            let mut replacement = None;
+            let mut state = State::Nothin;
+
+            for (idx, ch) in template.chars().enumerate() {
+                state = match state {
+                    State::Nothin => {
+                        match ch {
+                            '{' => {
+                                State::OpenBraceRun(vec![idx])
+                            }
+                            '}' => {
+                                State::CloseBraceRun(vec![idx])
+                            }
+                            _ => {
+                                State::Nothin
+                            }
+                        }
+                    }
+                    State::OpenBraceRun(mut open_braces) => {
+                        match ch {
+                            '{' => {
+                                open_braces.push(idx);
+                                State::OpenBraceRun(open_braces)
+                            }
+                            '}' => {
+                                if is_odd(open_braces.len()) {
+                                    let open_idx = open_braces.pop().unwrap();
+                                    if !open_braces.is_empty() {
+                                        open_brace_runs.push(open_braces);
+                                    }
+                                    State::CloseBraceRunWithOpener(open_idx, vec![idx])
+                                } else {
+                                    open_brace_runs.push(open_braces);
+                                    State::CloseBraceRun(vec![idx])
+                                }
+                            }
+                            _ => {
+                                if ch.is_whitespace() {
+                                    if is_odd(open_braces.len()) {
+                                        let open_idx = open_braces.pop().unwrap();
+                                        if !open_braces.is_empty() {
+                                            open_brace_runs.push(open_braces);
+                                        }
+                                        State::Opener(open_idx)
+                                    } else {
+                                        open_brace_runs.push(open_braces);
+                                        State::Nothin
+                                    }
+                                } else {
+                                    open_brace_runs.push(open_braces);
+                                    State::Nothin
+                                }
+                            }
+                        }
+                    }
+                    State::Opener(open_idx) => {
+                        match ch {
+                            '{' => {
+                                unreachable!();
+                            }
+                            '}' => {
+                                State::CloseBraceRunWithOpener(open_idx, vec![idx])
+                            }
+                            _ => {
+                                if ch.is_whitespace() {
+                                    State::Opener(open_idx)
+                                } else {
+                                    State::Nothin
+                                }
+                            }
+                        }
+                    }
+                    State::CloseBraceRun(mut close_braces) => {
+                        match ch {
+                            '{' => {
+                                close_brace_runs.push(close_braces);
+                                State::OpenBraceRun(vec![idx])
+                            }
+                            '}' => {
+                                close_braces.push(idx);
+                                State::CloseBraceRun(close_braces)
+                            }
+                            _ => {
+                                close_brace_runs.push(close_braces);
+                                State::Nothin
+                            }
+                        }
+                    }
+                    State::CloseBraceRunWithOpener(open_idx, mut close_braces) => {
+                        match ch {
+                            '{' => {
+                                if is_odd(close_braces.len()) {
+                                    if replacement.is_some() {
+                                        panic!("multiple {{}} in skeptic template");
+                                    }
+                                    let mut close_braces = VecDeque::from(close_braces);
+                                    let close_idx = close_braces.pop_front().unwrap();
+                                    replacement = Some((open_idx, close_idx));
+                                    if !close_braces.is_empty() {
+                                        close_brace_runs.push(Vec::from(close_braces));
+                                    }
+                                    State::OpenBraceRun(vec![idx])
+                                } else {
+                                    close_brace_runs.push(close_braces);
+                                    State::OpenBraceRun(vec![idx])
+                                }
+                            }
+                            '}' => {
+                                close_braces.push(idx);
+                                State::CloseBraceRunWithOpener(open_idx, close_braces)
+                            }
+                            _ => {
+                                if is_odd(close_braces.len()) {
+                                    if replacement.is_some() {
+                                        panic!("multiple {{}} in skeptic template");
+                                    }
+                                    let mut close_braces = VecDeque::from(close_braces);
+                                    let close_idx = close_braces.pop_front().unwrap();
+                                    replacement = Some((open_idx, close_idx));
+                                    if !close_braces.is_empty() {
+                                        close_brace_runs.push(Vec::from(close_braces));
+                                    }
+                                    State::Nothin
+                                } else {
+                                    close_brace_runs.push(close_braces);
+                                    State::Nothin
+                                }
+                            }
+                        }
+                    }
+                }
+            } // for chars in template
+
+            if !replacement.is_some() {
+                panic!("no {{}} found in skeptic template");
+            }
+
+            let replacement = replacement.unwrap();
+            let mut open_brace_runs = open_brace_runs;
+            let mut close_brace_runs = close_brace_runs;
+
+            for run in &mut open_brace_runs {
+                if is_odd(run.len()) {
+                    run.pop().unwrap();
+                }
+            }
+
+            for run in &mut close_brace_runs {
+                if is_odd(run.len()) {
+                    run.pop().unwrap();
+                }
+            }
+
+            let mut open_brace_runs = open_brace_runs.into_iter()
+                .flat_map(|r| r.into_iter()).collect::<VecDeque<_>>();
+            let mut close_brace_runs = close_brace_runs.into_iter()
+                .flat_map(|r| r.into_iter()).collect::<VecDeque<_>>();
+
+            let mut open_brace_pairs = VecDeque::new();
+            let mut close_brace_pairs = VecDeque::new();
+
+            while !open_brace_runs.is_empty() {
+                let start = open_brace_runs.pop_front().unwrap();
+                let end = open_brace_runs.pop_front().unwrap();
+                open_brace_pairs.push_back((start, end))
+            }
+            while !close_brace_runs.is_empty() {
+                let start = close_brace_runs.pop_front().unwrap();
+                let end = close_brace_runs.pop_front().unwrap();
+                close_brace_pairs.push_back((start, end))
+            }
+
+            let mut template_chars = template.chars().collect::<VecDeque<_>>();
+            let template_chars_len = template_chars.len();
+
+            let (rep_start, rep_end) = replacement;
+            let mut open_brace_pairs = open_brace_pairs;
+            let mut close_brace_pairs = close_brace_pairs;
+
+            // Build the test src while replacing {{, }}, and {}
+            let mut src = String::new();
+
+            writeln!(src, "// rep_start, rep_end: {}, {}", rep_start, rep_end);
+            writeln!(src, "// open_brace_pairs: {:?}", open_brace_pairs);
+            writeln!(src, "// close_brace_pairs: {:?}", close_brace_pairs);
+
+            let mut idx = 0;
+            while idx != template_chars_len {
+                let ch = template_chars.pop_front().unwrap();
+
+                if idx == rep_start {
+                    src.push_str(&test);
+                    idx += 1;
+                    while idx <= rep_end {
+                        let ch = template_chars.pop_front().unwrap();
+                        idx += 1;
+                    }
+                } else if open_brace_pairs.front().cloned().map(|(start, _)| start) == Some(idx) {
+                    let (open_start, open_end) = open_brace_pairs.pop_front().unwrap();
+                    assert!(open_start + 1 == open_end);
+                    template_chars.pop_front().unwrap();
+                    src.push('{');
+                    idx += 2;
+                } else if close_brace_pairs.front().cloned().map(|(start, _)| start) == Some(idx) {
+                    let (close_start, close_end) = close_brace_pairs.pop_front().unwrap();
+                    assert!(close_start + 1 == close_end);
+                    template_chars.pop_front().unwrap();
+                    src.push('}');
+                    idx += 2;
+                } else {
+                    src.push(ch);
+                    idx += 1;
+                }
+            }
+
+            src
+        } else {
+            test
+        }
     }
 
     /// Just like Rustdoc, ignore a "#" sign at the beginning of a line of code.
@@ -465,58 +1032,76 @@ mod emit {
             .collect()
     }
 
-    fn create_test_runner(
-        config: &Config,
-        template: &Option<String>,
-        test: &Test,
-    ) -> Result<String, IoError> {
+    fn emit_supercrate_project(config: &Config, suite: &DocTestSuite) -> Result<(), Box<StdError + Send + Sync + 'static>> {
+        let test_name = "master_skeptic";
+        let test_src = build_supercrate_src(config, suite);
+        let manifest_info = build_supercrate_manifest(config, suite);
 
-        let template = template.clone().unwrap_or_else(|| String::from("{}"));
-        let test_text = create_test_input(&test.text);
+        emit_project(&config.test_dir, &test_name, &test_src,
+                     &manifest_info, LibOrBin::Bin)
+    }
 
-        let mut s: Vec<u8> = Vec::new();
-        if test.ignore {
-            writeln!(s, "#[ignore]")?;
-        }
-        if test.should_panic {
-            writeln!(s, "#[should_panic]")?;
-        }
+    fn build_supercrate_src(config: &Config, suite: &DocTestSuite) -> String {
+        let mut s = String::new();
 
-        writeln!(s, "#[test]\nfn {}() {{", test.name)?;
-        writeln!(
-            s,
-            "    let s = &format!(r####\"{}{}\"####, r####\"{}\"####);",
-            "\n\n",
-            template,
-            test_text
-        )?;
-
-        // if we are not running, just compile the test without running it
-        if test.no_run {
-            writeln!(
-                s,
-                "    skeptic::rt::compile_test(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
-                config.root_dir.to_str().unwrap(),
-                config.out_dir.to_str().unwrap(),
-                config.target_triple
-            )?;
-        } else {
-            writeln!(
-                s,
-                "    skeptic::rt::run_test(r#\"{}\"#, r#\"{}\"#, r#\"{}\"#, s);",
-                config.root_dir.to_str().unwrap(),
-                config.out_dir.to_str().unwrap(),
-                config.target_triple
-            )?;
+        let mut sb = String::new();
+        for test_doc in &suite.doc_tests {
+            for test in &test_doc.tests {
+                if !(test.ignore || test.no_run) {
+                    writeln!(sb, r#"    if test_name == "{}" {{"#, test.name);
+                    writeln!(sb, r#"        exit_code = {}::__skeptic_main();"#, test.name);
+                    writeln!(sb, r#"    }}"#);
+                    writeln!(sb);
+                }
+            }
         }
 
-        writeln!(s, "}}")?;
-        writeln!(s, "\n")?;
+        let switch_buf = sb;
 
-        Ok(String::from_utf8(s).unwrap())
+        writeln!(s, r#"
+fn main() {{
+
+    let test_name = std::env::args().skip(1).next().expect("arg 1 is test name");
+
+    let mut exit_code = 0;
+
+{}
+
+    std::process::exit(exit_code);
+}}"#,
+                 switch_buf,
+                 
+        );
+
+        s
+    }
+
+    fn build_supercrate_manifest(config: &Config, suite: &DocTestSuite) -> ManifestInfo {
+
+        let mut deps = BTreeMap::new();
+        
+        for test_doc in &suite.doc_tests {
+            for test in &test_doc.tests {
+                if !test.ignore && !test.no_run {
+                    let mut props = BTreeMap::new();
+                    let path = format!("../{}", test.name.clone());
+                    props.insert("path".to_string(), Value::String(path));
+
+                    deps.insert(test.name.clone(), Value::Table(props));
+                }
+            }
+        }
+        
+        ManifestInfo {
+            deps: Some(Value::Table(deps)),
+            dev_deps: None,
+            build_deps: None,
+        }
     }
 
     fn write_if_contents_changed(name: &Path, contents: &str) -> Result<(), IoError> {
+        use std::io::Write;
+
         let out_dir = name.parent().expect("test path name should contain a directory and file");
         fs::create_dir_all(out_dir)?;
 
@@ -538,558 +1123,4 @@ mod emit {
         Ok(())
     }
 
-}
-
-pub mod rt {
-    extern crate serde_json;
-    extern crate cargo_metadata;
-    extern crate walkdir;
-
-    use std::collections::HashMap;
-    use std::collections::hash_map::Entry;
-    use std::time::SystemTime;
-
-    use std::{self, env};
-    use std::fs::File;
-    use std::io::{self, Write};
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::ffi::OsStr;
-    use std::str::FromStr;
-    use tempdir::TempDir;
-
-    use self::walkdir::WalkDir;
-    use self::serde_json::Value;
-
-    error_chain! {
-        errors { Fingerprint }
-        foreign_links {
-            Io(std::io::Error);
-            Metadata(cargo_metadata::Error);
-            Json(serde_json::Error);
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    enum CompileType {
-        Full,
-        Check,
-    }
-
-    // An iterator over the root dependencies in a lockfile
-    #[derive(Debug)]
-    struct LockedDeps {
-        dependencies: Vec<String>,
-    }
-
-    impl LockedDeps {
-        fn from_path<P: AsRef<Path>>(pth: P) -> Result<LockedDeps> {
-            let pth = pth.as_ref().join("Cargo.toml");
-            let metadata = cargo_metadata::metadata_deps(Some(&pth), true)?;
-            let workspace_members:Vec<String> = metadata.workspace_members
-                .into_iter()
-                .map(|workspace| {format!("{} {} ({})", workspace.name(), workspace.version(), workspace.url())})
-                .collect();
-            let deps = metadata.resolve.ok_or("Missing dependency metadata")?
-                .nodes
-                .into_iter()
-                .filter(|node| workspace_members.contains(&node.id))
-                .flat_map(|node| node.dependencies.into_iter())
-                .chain(workspace_members.clone());
-
-            Ok(LockedDeps { dependencies: deps.collect() })
-        }
-    }
-
-    impl Iterator for LockedDeps {
-        type Item = (String, String);
-
-        fn next(&mut self) -> Option<(String, String)> {
-            self.dependencies.pop().and_then(|val| {
-                let mut it = val.split_whitespace();
-
-                match (it.next(), it.next()) {
-                    (Some(name), Some(val)) => {
-                        Some((name.replace("-", "_").to_owned(), val.to_owned()))
-                    }
-                    _ => None,
-                }
-            })
-        }
-    }
-
-    #[derive(Debug)]
-    struct Fingerprint {
-        libname: String,
-        version: Option<String>, // version might not be present on path or vcs deps
-        rlib: PathBuf,
-        mtime: SystemTime,
-    }
-
-    fn guess_ext(mut pth: PathBuf, exts: &[&str]) -> Result<PathBuf> {
-        for ext in exts {
-            pth.set_extension(ext);
-            if pth.exists() {
-                return Ok(pth);
-            }
-        }
-        Err(ErrorKind::Fingerprint.into())
-    }
-
-    impl Fingerprint {
-        fn from_path<P: AsRef<Path>>(pth: P) -> Result<Fingerprint> {
-            let pth = pth.as_ref();
-
-            let fname = pth.file_stem().and_then(OsStr::to_str).ok_or(
-                ErrorKind::Fingerprint,
-            )?;
-
-            pth.extension()
-                .and_then(|e| if e == "json" { Some(e) } else { None })
-                .ok_or(ErrorKind::Fingerprint)?;
-
-            let mut captures = fname.splitn(3, '-');
-            captures.next();
-            let libname = captures.next().ok_or(ErrorKind::Fingerprint)?;
-            let hash = captures.next().ok_or(ErrorKind::Fingerprint)?;
-
-            let mut rlib = PathBuf::from(pth);
-            rlib.pop();
-            rlib.pop();
-            rlib.pop();
-            rlib.push(format!("deps/lib{}-{}", libname, hash));
-            rlib = guess_ext(rlib, &["rlib", "so", "dylib", "dll"])?;
-
-            let file = File::open(pth)?;
-            let mtime = file.metadata()?.modified()?;
-            let parsed: Value = serde_json::from_reader(file)?;
-            let vers = parsed["local"]["Precalculated"]
-                .as_str()
-                // fingerprint file sometimes has different form
-                .or_else(|| parsed["local"][0]["Precalculated"].as_str())
-                .map(|v| v.to_owned());
-
-            Ok(Fingerprint {
-                libname: libname.to_owned(),
-                version: vers,
-                rlib: rlib,
-                mtime: mtime,
-            })
-        }
-
-        fn name(&self) -> String {
-            self.libname.clone()
-        }
-
-        fn version(&self) -> Option<String> {
-            self.version.clone()
-        }
-    }
-
-    fn get_edition<P: AsRef<Path>>(path: P) -> Result<String> {
-        let path = path.as_ref().join("Cargo.toml");
-        let manifest = cargo_metadata::metadata(Some(&path))?;
-        let edition = manifest.packages.iter()
-            .map(|package| &package.edition)
-            .max_by_key(|edition| u64::from_str(edition).unwrap())
-            .unwrap()
-            .clone();
-        Ok(edition)
-    }
-
-    // Retrieve the exact dependencies for a given build by
-    // cross-referencing the lockfile with the fingerprint file
-    fn get_rlib_dependencies<P: AsRef<Path>>(
-        root_dir: P,
-        target_dir: P,
-    ) -> Result<Vec<Fingerprint>> {
-        let root_dir = root_dir.as_ref();
-        let target_dir = target_dir.as_ref();
-        let lock = LockedDeps::from_path(root_dir).or_else(
-            |_| {
-                // could not find Cargo.lock in $CARGO_MAINFEST_DIR
-                // try relative to target_dir
-                let mut root_dir = PathBuf::from(target_dir);
-                root_dir.pop();
-                root_dir.pop();
-                LockedDeps::from_path(root_dir)
-            },
-        )?;
-
-        let fingerprint_dir = target_dir.join(".fingerprint/");
-        let locked_deps: HashMap<String, String> = lock.collect();
-        let mut found_deps: HashMap<String, Fingerprint> = HashMap::new();
-
-        for finger in WalkDir::new(fingerprint_dir)
-            .into_iter()
-            .filter_map(|v| v.ok())
-            .filter_map(|v| Fingerprint::from_path(v.path()).ok())
-        {
-            if let Some(locked_ver) = locked_deps.get(&finger.name()) {
-                // TODO this should be refactored to something more readable
-                match (found_deps.entry(finger.name()), finger.version()) {
-                    (Entry::Occupied(mut e), Some(ver)) => {
-                        // we find better match only if it is exact version match
-                        // and has fresher build time
-                        if *locked_ver == ver && e.get().mtime < finger.mtime {
-                            e.insert(finger);
-                        }
-                    }
-                    (Entry::Vacant(e), ver) => {
-                        // we see an exact match or unversioned version
-                        if ver.unwrap_or_else(|| locked_ver.clone()) == *locked_ver {
-                            e.insert(finger);
-                        }
-                    }
-                    _ => (),
-                }
-            }
-        }
-
-        Ok(
-            found_deps
-                .into_iter()
-                .filter_map(|(_, val)| if val.rlib.exists() { Some(val) } else { None })
-                .collect(),
-        )
-    }
-
-    pub fn compile_test(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &str) {
-        let rustc = &env::var("RUSTC").unwrap_or_else(|_| String::from("rustc"));
-        let outdir = &TempDir::new("rust-skeptic").unwrap();
-        let testcase_path = &outdir.path().join("test.rs");
-        let binary_path = &outdir.path().join("out.exe");
-
-        write_test_case(testcase_path, test_text);
-        compile_test_case(
-            testcase_path,
-            binary_path,
-            rustc,
-            root_dir,
-            out_dir,
-            target_triple,
-            CompileType::Check,
-        );
-    }
-
-    pub fn run_test(root_dir: &str, out_dir: &str, target_triple: &str, test_text: &str) {
-        let rustc = &env::var("RUSTC").unwrap_or_else(|_| String::from("rustc"));
-        let outdir = &TempDir::new("rust-skeptic").unwrap();
-        let testcase_path = &outdir.path().join("test.rs");
-        let binary_path = &outdir.path().join("out.exe");
-
-        write_test_case(testcase_path, test_text);
-        compile_test_case(
-            testcase_path,
-            binary_path,
-            rustc,
-            root_dir,
-            out_dir,
-            target_triple,
-            CompileType::Full,
-        );
-        run_test_case(binary_path, outdir.path());
-    }
-
-    fn write_test_case(path: &Path, test_text: &str) {
-        let mut file = File::create(path).unwrap();
-        file.write_all(test_text.as_bytes()).unwrap();
-    }
-
-    fn compile_test_case(
-        in_path: &Path,
-        out_path: &Path,
-        rustc: &str,
-        root_dir: &str,
-        out_dir: &str,
-        target_triple: &str,
-        compile_type: CompileType,
-    ) {
-
-        // OK, here's where a bunch of magic happens using assumptions
-        // about cargo internals. We are going to use rustc to compile
-        // the examples, but to do that we've got to tell it where to
-        // look for the rlibs with the -L flag, and what their names
-        // are with the --extern flag. This is going to involve
-        // parsing fingerprints out of the lockfile and looking them
-        // up in the fingerprint file.
-
-        let root_dir = PathBuf::from(root_dir);
-        let mut target_dir = PathBuf::from(out_dir);
-        target_dir.pop();
-        target_dir.pop();
-        target_dir.pop();
-        let mut deps_dir = target_dir.clone();
-        deps_dir.push("deps");
-
-        let mut cmd = Command::new(rustc);
-        cmd.arg(in_path)
-            .arg("--verbose")
-            .arg("--crate-type=bin");
-
-        // This has to come before "-L".
-        let edition = get_edition(&root_dir).expect("failed to read Cargo.toml");
-        if edition != "2015" {
-            cmd.arg(format!("--edition={}", edition));
-        }
-        
-        cmd.arg("-L")
-            .arg(&target_dir)
-            .arg("-L")
-            .arg(&deps_dir)
-            .arg("--target")
-            .arg(&target_triple);
-
-
-        for dep in get_rlib_dependencies(root_dir, target_dir).expect(
-            "failed to read dependencies",
-        )
-        {
-            cmd.arg("--extern");
-            cmd.arg(format!(
-                "{}={}",
-                dep.libname,
-                dep.rlib.to_str().expect("filename not utf8"),
-            ));
-        }
-
-        match compile_type {
-            CompileType::Full => cmd.arg("-o").arg(out_path),
-            CompileType::Check => {
-                cmd.arg(format!(
-                    "--emit=dep-info={0}.d,metadata={0}.m",
-                    out_path.display()
-                ))
-            }
-        };
-
-        interpret_output(cmd);
-    }
-
-    fn run_test_case(program_path: &Path, outdir: &Path) {
-        let mut cmd = Command::new(program_path);
-        cmd.current_dir(outdir);
-        interpret_output(cmd);
-    }
-
-    fn interpret_output(mut command: Command) {
-        let output = command.output().unwrap();
-        write!(
-            io::stdout(),
-            "{}",
-            String::from_utf8(output.stdout).unwrap()
-        ).unwrap();
-        write!(
-            io::stderr(),
-            "{}",
-            String::from_utf8(output.stderr).unwrap()
-        ).unwrap();
-        if !output.status.success() {
-            panic!("Command failed:\n{:?}", command);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    extern crate unindent;
-
-    use super::*;
-    use self::unindent::unindent;
-
-    #[test]
-    fn test_omitted_lines() {
-        let lines = unindent(
-            r###"
-            # use std::collections::BTreeMap as Map;
-            #
-            #[allow(dead_code)]
-            fn main() {
-                let map = Map::new();
-                #
-                # let _ = map;
-            }"###,
-        );
-
-        let expected = unindent(
-            r###"
-            use std::collections::BTreeMap as Map;
-
-            #[allow(dead_code)]
-            fn main() {
-                let map = Map::new();
-
-            let _ = map;
-            }
-            "###,
-        );
-
-        assert_eq!(create_test_input(&get_lines(lines)), expected);
-    }
-
-    #[test]
-    fn test_markdown_files_of_directory() {
-        let files = vec![
-            "../../tests/hashtag-test.md",
-            "../../tests/section-names.md",
-            "../../tests/should-panic-test.md",
-        ];
-        let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
-        assert_eq!(markdown_files_of_directory("../../tests/"), files);
-    }
-
-    #[test]
-    fn test_sanitization_of_testnames() {
-        assert_eq!(sanitize_test_name("My_Fun"), "my_fun");
-        assert_eq!(sanitize_test_name("__my_fun_"), "my_fun");
-        assert_eq!(sanitize_test_name("^$@__my@#_fun#$@"), "my_fun");
-        assert_eq!(
-            sanitize_test_name(
-                "my_long__fun___name___with____a_____lot______of_______spaces",
-            ),
-            "my_long_fun_name_with_a_lot_of_spaces"
-        );
-        assert_eq!(sanitize_test_name("Löwe 老虎 Léopard"), "l_we_l_opard");
-    }
-
-    #[test]
-    fn line_numbers_displayed_are_for_the_beginning_of_each_code_block() {
-        let lines = unindent(
-            r###"
-            Rust code that should panic when running it.
-
-            ```rust,should_panic",/
-            fn main() {
-                panic!(\"I should panic\");
-            }
-            ```
-
-            Rust code that should panic when compiling it.
-
-            ```rust,no_run,should_panic",//
-            fn add(a: u32, b: u32) -> u32 {
-                a + b
-            }
-
-            fn main() {
-                add(1);
-            }
-            ```"###,
-        );
-
-
-        let tests =
-            extract_tests_from_string(&create_test_input(&get_lines(lines)), &String::from("blah"));
-
-        let test_names: Vec<String> = tests
-            .0
-            .into_iter()
-            .map(|test| get_line_number_from_test_name(test))
-            .collect();
-
-        assert_eq!(test_names, vec!["3", "11"]);
-    }
-
-
-    #[test]
-    fn line_numbers_displayed_are_for_the_beginning_of_each_section() {
-        let lines = unindent(r###"
-            ## Test Case  Names   With    weird     spacing       are        generated      without        error.
-
-            ```rust", /
-            struct Person<'a>(&'a str);
-            fn main() {
-              let _ = Person(\"bors\");
-            }
-            ```
-
-            ## !@#$ Test Cases )(() with {}[] non alphanumeric characters ^$23 characters are \"`#`\" generated correctly @#$@#$  22.
-
-            ```rust", //
-            struct Person<'a>(&'a str);
-            fn main() {
-              let _ = Person(\"bors\");
-            }
-            ```
-
-            ## Test cases with non ASCII ö_老虎_é characters are generated correctly.
-
-            ```rust",//
-            struct Person<'a>(&'a str);
-            fn main() {
-              let _ = Person(\"bors\");
-            }
-            ```"###);
-
-        let tests =
-            extract_tests_from_string(&create_test_input(&get_lines(lines)), &String::from("blah"));
-
-        let test_names: Vec<String> = tests
-            .0
-            .into_iter()
-            .map(|test| get_line_number_from_test_name(test))
-            .collect();
-
-        assert_eq!(test_names, vec!["3", "12", "21"]);
-    }
-
-    #[test]
-    fn old_template_is_returned_for_old_skeptic_template_format() {
-        let lines = unindent(
-            r###"
-            ```rust,skeptic-template
-            ```rust,ignore
-            use std::path::PathBuf;
-
-            fn main() {{
-                {}
-            }}
-            ```
-            ```
-            "###,
-        );
-        let expected = unindent(
-            r###"
-            ```rust,ignore
-            use std::path::PathBuf;
-
-            fn main() {{
-                {}
-            }}
-            "###,
-        );
-        let tests =
-            extract_tests_from_string(&create_test_input(&get_lines(lines)), &String::from("blah"));
-        assert_eq!(tests.1, Some(expected));
-    }
-
-    #[test]
-    fn old_template_is_not_returned_if_old_skeptic_template_is_not_specified() {
-        let lines = unindent(
-            r###"
-            ```rust", /
-            struct Person<'a>(&'a str);
-            fn main() {
-              let _ = Person(\"bors\");
-            }
-            ```
-            "###,
-        );
-        let tests =
-            extract_tests_from_string(&create_test_input(&get_lines(lines)), &String::from("blah"));
-        assert_eq!(tests.1, None);
-    }
-
-
-    fn get_line_number_from_test_name(test: Test) -> String {
-        String::from(test.name.split('_').last().expect(
-            "There were no underscores!",
-        ))
-    }
-
-    fn get_lines(lines: String) -> Vec<String> {
-        lines.split('\n')
-            .map(|string_slice| format!("{}\n", string_slice))//restore line endings since they are removed by split.
-            .collect()
-    }
 }
