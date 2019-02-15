@@ -119,9 +119,6 @@ where
 
     let (target_dir, out_dir_has_triple) = target_dir_from_out_dir(&out_dir, &target_triple);
 
-    let manifest_info = extract_manifest_info(&cargo_manifest_dir)
-        .expect("unable to parse manifest for skeptic test generation");
-
     let config = Config {
         root_dir: cargo_manifest_dir,
         test_dir: test_dir,
@@ -132,7 +129,6 @@ where
         cargo: cargo,
         rustc: rustc,
         docs: docs,
-        manifest_info: manifest_info,
     };
 
     run(&config);
@@ -165,92 +161,6 @@ fn target_dir_from_out_dir(out_dir: &Path, target_triple: &str) -> (PathBuf, boo
     }
 }
 
-fn extract_manifest_info(manifest_dir: &Path) -> Result<ManifestInfo, Box<StdError + Sync + Send + 'static>> {
-
-    use std::fs::File;
-    use std::io::Read;
-    use toml::Value;
-
-    let mut manifest = manifest_dir.to_owned();
-    manifest.push("Cargo.toml");
-
-    let mut manifest_buf = String::new();
-
-    File::open(manifest)?.read_to_string(&mut manifest_buf)?;
-
-    let mani_value = manifest_buf.parse::<Value>()?;
-
-    let mut deps = None;
-    let mut dev_deps = None;
-    let mut build_deps = None;
-
-    if let Value::Table(sections) = mani_value {
-        for (sec_key, sec_value) in sections {
-            match sec_key.as_str() {
-                "dependencies" => {
-                    deps = Some(sanitize_deps(sec_value));
-                }
-                "dev-dependencies" => {
-                    dev_deps = Some(sanitize_deps(sec_value));
-                }
-                "build-dependencies" => {
-                    build_deps = Some(sanitize_deps(sec_value));
-                }
-                _ => { }
-            }
-        }
-    } else {
-        panic!("unexpected toml type in manifest {:?}", mani_value);
-    }
-
-    Ok(ManifestInfo {
-        deps, dev_deps, build_deps,
-    })
-}
-
-fn sanitize_deps(toml: Value) -> Value {
-    if let Value::Table(deps) = toml {
-        let mut new_deps = BTreeMap::new();
-
-        for (name, props) in deps {
-            if let Value::Table(props) = props {
-                let mut new_props = BTreeMap::new();
-
-                for (prop_name, prop_value) in props {
-                    if prop_name == "path" {
-                        if let Value::String(prop_value) = prop_value {
-                            let path = PathBuf::from(&prop_value);
-                            if !path.is_absolute() {
-                                // rewrite dependency paths to account for the location
-                                // of the test manifest, "tests/skeptic/$test_name/"
-                                // FIXME: This only works 
-                                let mut prop_value = format!("../../../{}", prop_value);
-                                new_props.insert(prop_name, Value::String(prop_value));
-                            } else {
-                                new_props.insert(prop_name, Value::String(prop_value));
-                            }
-                        } else {
-                            new_props.insert(prop_name, prop_value);
-                        }
-                    } else {
-                        new_props.insert(prop_name, prop_value);
-                    }
-                }
-
-                new_deps.insert(name, Value::Table(new_props));
-            } else if let Value::String(s) = props {
-                new_deps.insert(name, Value::String(s));
-            } else {
-                panic!("dep props are not a table or string: {:?}", props);
-            }
-        }
-
-        Value::Table(new_deps)
-    } else {
-        panic!("deps are not a table");
-    }
-}
-
 struct Config {
     root_dir: PathBuf,
     test_dir: PathBuf,
@@ -261,14 +171,6 @@ struct Config {
     cargo: String,
     rustc: String,
     docs: Vec<String>,
-    manifest_info: ManifestInfo,
-}
-
-#[derive(Debug)]
-struct ManifestInfo {
-    deps: Option<Value>,
-    dev_deps: Option<Value>,
-    build_deps: Option<Value>,
 }
 
 fn run(config: &Config) {
@@ -287,6 +189,7 @@ struct Test {
 
 struct DocTestSuite {
     doc_tests: Vec<DocTest>,
+    manifest: Manifest,
 }
 
 struct DocTest {
@@ -295,6 +198,9 @@ struct DocTest {
     tests: Vec<Test>,
     templates: HashMap<String, String>,
 }
+
+#[derive(Debug)]
+struct Manifest(Value);
 
 mod extract;
 mod emit;
