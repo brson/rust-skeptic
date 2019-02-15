@@ -40,8 +40,9 @@ fn emit_test_cases(config: &Config, suite: &DocTestSuite) -> Result<(), IoError>
             writeln!(s, r#"    let mut cmd = Command::new("{}");"#, config.cargo);
             writeln!(s, r#"    cmd"#);
             writeln!(s, r#"        .env("RUSTC", "{}")"#, config.rustc);
-            // ... shhhhhh ...
+            // ... shhhhhh ... this gives access to the Termination trait
             writeln!(s, r#"        .env("RUSTC_BOOTSTRAP", "1")"#);
+            writeln!(s, r#"        .env("SKEPTIC_TEST_NAME", "{}")"#, test.name);
             if !test.no_run {
                 writeln!(s, r#"        .arg("run")"#);
             } else {
@@ -56,15 +57,9 @@ fn emit_test_cases(config: &Config, suite: &DocTestSuite) -> Result<(), IoError>
             } else {
                 write!(s, r#"        .arg("--manifest-path={}/{}/{}")"#, config.test_dir.display(), test.name, "Cargo.toml");
             }
-            writeln!(s, r#"        .arg("-Zunstable-options")"#);
+            //writeln!(s, r#"        .arg("-Zunstable-options")"#);
             //writeln!(s, r#"        .arg("-Zoffline")"#);
-            if !test.no_run {
-                writeln!(s);
-                writeln!(s, r#"        .arg("--")"#);
-                writeln!(s, r#"        .arg("{}");"#, test.name);
-            } else {
-                writeln!(s, r#";"#);
-            }
+            writeln!(s, r#"          ;"#);
             writeln!(s);
 
             writeln!(s, r#"    let res = cmd.status()"#);
@@ -147,12 +142,7 @@ fn build_test_src(test_doc: &DocTest, test: &Test) -> String {
     writeln!(s);
     writeln!(s, r#"pub fn __skeptic_main() -> i32 {{"#);
     writeln!(s, r#"    use std::process::Termination;"#);
-    writeln!(s, r#"    let r = main();"#);
-    writeln!(s, r#"    let exit_code = r.report();"#);
-    writeln!(s, r#"    if exit_code != 0 {{"#);
-    writeln!(s, r#"        println!("{{:#?}}", r);"#);
-    writeln!(s, r#"    }}"#);
-    writeln!(s, r#"    exit_code"#);
+    writeln!(s, r#"    main().report()"#);
     writeln!(s, r#"}}"#);
 
     s
@@ -603,7 +593,8 @@ fn build_supercrate_src(config: &Config, suite: &DocTestSuite) -> String {
     writeln!(s, r#"
 fn main() {{
 
-    let test_name = std::env::args().skip(1).next().expect("arg 1 is test name");
+    let test_name = std::env::var("SKEPTIC_TEST_NAME")
+        .expect("SKEPTIC_TEST_NAME not set");
 
     let mut exit_code = 0;
 

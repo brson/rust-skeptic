@@ -1,3 +1,10 @@
+// TODO
+//
+// - put all skeptic projects into a single workspace
+// - resolve a single time, under mutex
+// - run with --locked, -Zoffline
+// - resolve lockfile only when manifest or test docs change
+
 extern crate pulldown_cmark as cmark;
 extern crate tempdir;
 extern crate glob;
