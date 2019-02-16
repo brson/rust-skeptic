@@ -21,60 +21,49 @@ fn emit_test_cases(config: &Config, suite: &DocTestSuite) -> Result<(), IoError>
 
     writeln!(buf, "use std::process::Command;");
     writeln!(buf);
+    writeln!(buf, r#"
+static CARGO: &str = "{}";
+static RUSTC: &str = "{}";
+static TARGET_DIR: &str = "{}";
+static TARGET_EXE_DIR: &str = "{}";
+static MANIFEST: &str = "{}/master_skeptic/Cargo.toml";
+static TARGET_TRIPLE: &str = "{}";
+static OUT_DIR_HAS_TRIPLE: bool = {};"#,
+             config.cargo,
+             config.rustc,
+             config.target_dir.display(),
+             config.target_exe_dir.display(),
+             config.test_dir.display(),
+             config.target_triple,
+             config.out_dir_has_triple,
+    );
+    writeln!(buf);
+    writeln!(buf);
 
     for test_doc in &suite.doc_tests {
         for test in &test_doc.tests {
             let mut s = String::new();
 
-            if test.ignore { writeln!(s, "/* skeptic-ignored test"); }
-
+            writeln!(s, "// file {}; line {}", test_doc.short_path.display(), test.line);
+            if test.ignore { writeln!(s, "/*"); }
+            if test.ignore { writeln!(s, "// skeptic-ignored test"); }
             if test.no_run { writeln!(s, "// skeptic-no_run test"); }
-
             if test.should_panic { writeln!(s, "#[should_panic]"); }
 
-            writeln!(s, "#[test]");
-            writeln!(s, "fn {}() {{", test.name);
-
-            // todo: --release, --nocapture
-
-            writeln!(s, r#"    let mut cmd = Command::new("{}");"#, config.cargo);
-            writeln!(s, r#"    cmd"#);
-            writeln!(s, r#"        .env("RUSTC", "{}")"#, config.rustc);
-            // ... shhhhhh ... this gives access to the Termination trait
-            writeln!(s, r#"        .env("RUSTC_BOOTSTRAP", "1")"#);
-            writeln!(s, r#"        .env("SKEPTIC_TEST_NAME", "{}")"#, test.name);
-            if !test.no_run {
-                writeln!(s, r#"        .arg("run")"#);
-            } else {
-                writeln!(s, r#"        .arg("build")"#);
-            }
-            writeln!(s, r#"        .arg("--target-dir={}")"#, config.target_dir.display());
-            if config.out_dir_has_triple {
-                writeln!(s, r#"        .arg("--target={}")"#, config.target_triple);
-            }
-            if !test.no_run {
-                write!(s, r#"        .arg("--manifest-path={}/{}/{}")"#, config.test_dir.display(), "master_skeptic", "Cargo.toml");
-            } else {
-                write!(s, r#"        .arg("--manifest-path={}/{}/{}")"#, config.test_dir.display(), test.name, "Cargo.toml");
-            }
-            //writeln!(s, r#"        .arg("-Zunstable-options")"#);
-            //writeln!(s, r#"        .arg("-Zoffline")"#);
-            writeln!(s, r#"          ;"#);
-            writeln!(s);
-
-            writeln!(s, r#"    let res = cmd.status()"#);
-            writeln!(s, r#"        .expect("cargo failed to run for test {}");"#, test.name);
-            writeln!(s);
-
-            writeln!(s, r#"    if !res.success() {{"#);
-            if !test.no_run {
-                writeln!(s, r#"        panic!("cargo run {} failed")"#, test.name);
-            } else {
-                writeln!(s, r#"        panic!("cargo build {} failed")"#, test.name);
-            }
-            writeln!(s, r#"    }}"#);
-
-            writeln!(s, "}}"); // 'fn' closer
+            writeln!(s,
+r#"#[test]
+fn {test_name}() {{
+    static TEST_NAME: &str = "{test_name}";
+    static NO_RUN: bool = {no_run};
+    static SHORT_PATH: &str = "{short_path}";
+    static LINE_NUMBER: usize = {line_number};
+    run_test(TEST_NAME, NO_RUN, SHORT_PATH, LINE_NUMBER);
+}}"#,
+                     test_name = test.name,
+                     no_run = test.no_run,
+                     short_path = test_doc.short_path.display(),
+                     line_number = test.line,
+            );
 
             if test.ignore { writeln!(s, "*/"); }
 
@@ -82,6 +71,141 @@ fn emit_test_cases(config: &Config, suite: &DocTestSuite) -> Result<(), IoError>
             writeln!(buf);
         }
     }
+
+    writeln!(buf, r#"
+fn run_test(test_name: &str, no_run: bool, short_path: &str, line_no: usize) {{
+    // todo: --release, --nocapture
+
+    wait_for_resolve_and_fetch();
+
+    if !no_run {{
+        wait_for_build_master_skeptic();
+        run_master_skeptic_test(test_name, short_path, line_no);
+    }} else {{
+        run_no_run_test(test_name, short_path, line_no);
+    }}
+}}
+
+fn wait_for_resolve_and_fetch() {{
+
+    static INIT: std::sync::Once = std::sync::ONCE_INIT;
+
+    INIT.call_once(|| {{
+
+        let mut cmd = Command::new(CARGO);
+        cmd
+            .arg("generate-lockfile")
+            .arg(&format!("--manifest-path={{}}", MANIFEST))
+            .env("RUSTC_BOOTSTRAP", "1")
+            .arg("-Zunstable-options")
+            .arg("-Zno-index-update")
+            .arg("-Zoffline");
+
+        let res = cmd.status()
+            .expect("skeptic failed to run cargo to generate master_skeptic lockfile");
+
+        if !res.success() {{
+            panic!("failed to initialize master_skeptic");
+        }}
+
+        let mut cmd = Command::new(CARGO);
+        cmd
+            .arg("fetch")
+            .arg(&format!("--manifest-path={{}}", MANIFEST))
+            .env("RUSTC_BOOTSTRAP", "1")
+            .arg("-Zunstable-options")
+            .arg("-Zoffline");
+
+        let res = cmd.status()
+            .expect("skeptic failed to run cargo to fetch master_skeptic deps");
+
+        if !res.success() {{
+            panic!("failed to initialize master_skeptic");
+        }}
+
+    }});
+}}
+
+fn wait_for_build_master_skeptic() {{
+
+    static INIT: std::sync::Once = std::sync::ONCE_INIT;
+
+    INIT.call_once(|| {{
+
+        let mut cmd = Command::new(CARGO);
+        cmd
+            .env("RUSTC", RUSTC)
+            // ... shhhhhh ... this gives access to the Termination trait
+            .env("RUSTC_BOOTSTRAP", "1")
+            .arg("build")
+            .arg(&format!("--manifest-path={{}}", MANIFEST))
+            .arg(&format!("--target-dir={{}}", TARGET_DIR))
+            .env("RUSTC_BOOTSTRAP", "1")
+            .arg("-Zunstable-options")
+            .arg("-Zoffline");
+
+        if OUT_DIR_HAS_TRIPLE {{
+            cmd.arg(&format!("--target={{}}", TARGET_TRIPLE));
+        }}
+
+        let res = cmd.status()
+            .expect(&format!("cargo failed to run for master skeptic"));
+
+        if !res.success() {{
+            panic!("failed to initialize master_skeptic");
+        }}
+
+    }});
+}}
+
+fn run_master_skeptic_test(test_name: &str, short_path: &str, line_no: usize) {{
+
+    let exe = format!("{{}}/master_skeptic", TARGET_EXE_DIR);
+
+    let res = Command::new(exe)
+        .env("SKEPTIC_TEST_NAME", test_name)
+        .status();
+    let res = res.expect("failed to execute bin for master_skeptic test");
+
+    if !res.success() {{
+        panic!("test {{}} - line {{}} failed, test {{}}",
+               short_path, line_no, test_name);
+    }}
+}}
+
+fn run_no_run_test(test_name: &str, short_path: &str, line_no: usize) {{
+
+    let mut cmd = Command::new(CARGO);
+    cmd
+        .env("RUSTC", RUSTC)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .arg("build")
+        .arg(&format!("--manifest-path={{}}", MANIFEST))
+        .arg(&format!("--target-dir={{}}", TARGET_DIR))
+        .env("RUSTC_BOOTSTRAP", "1")
+        .arg("-Zunstable-options")
+        .arg("-Zoffline");
+
+    if OUT_DIR_HAS_TRIPLE {{
+        cmd.arg(&format!("--target={{}}", TARGET_TRIPLE));
+    }}
+
+    cmd
+        .arg("--frozen")
+        .arg("--locked")
+        .arg("-p")
+        .arg(&format!("{{}}", test_name));
+
+    let res = cmd.status()
+        .expect(&format!("cargo failed to run for test {{}}", test_name));
+
+    if !res.success() {{
+        panic!("cargo build for {{}} - line {{}} failed, test {{}}",
+               short_path, line_no, test_name);
+    }}
+}}
+
+"#);
 
     fs::create_dir_all(&config.test_dir)?;
 
@@ -113,6 +237,9 @@ fn emit_project(test_dir: &Path, test_name: &str, test_src: &str,
                 template_manifest: &Manifest, lib_bin: LibOrBin) -> Result<(), Box<StdError + Send + Sync + 'static>> {
 
     let mut test_dir = test_dir.to_owned();
+    if test_name != "master_skeptic" {
+        test_dir.push("master_skeptic");
+    }
     test_dir.push(test_name.to_string());
 
     let mut test_manifest = test_dir.clone();
@@ -135,10 +262,15 @@ fn emit_project(test_dir: &Path, test_name: &str, test_src: &str,
 fn build_test_src(test_doc: &DocTest, test: &Test) -> String {
     let template = get_template(test_doc, test);
     let test_text = create_test_input(&test.text);
-    let s = compose_template(&template, test_text);
+    let test_src = compose_template(&template, test_text);
 
-    let mut s = format!("#![feature(termination_trait_lib)] // skeptic\n\n{}", s);
+    let mut s = String::new();
 
+    writeln!(s, "// file {}, line {}", test_doc.short_path.display(), test.line);
+    writeln!(s, "// test {}", test.name);
+    writeln!(s, "#![feature(termination_trait_lib)] // skeptic");
+    writeln!(s);
+    writeln!(s, "{}", test_src);
     writeln!(s);
     writeln!(s, r#"pub fn __skeptic_main() -> i32 {{"#);
     writeln!(s, r#"    use std::process::Termination;"#);
@@ -148,7 +280,7 @@ fn build_test_src(test_doc: &DocTest, test: &Test) -> String {
     s
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Copy, Clone)]
 enum LibOrBin { Lib, Bin }
 
 fn build_manifest(template_manifest: &Manifest, test_name: &str, lib_bin: LibOrBin) -> Value {
@@ -159,14 +291,20 @@ fn build_manifest(template_manifest: &Manifest, test_name: &str, lib_bin: LibOrB
         if let Value::Table(sections) = &template_manifest.0 {
             for (sec_key, sec_value) in sections {
                 match sec_key.as_str() {
+                    "features" => {
+                        toml_map.insert(sec_key.clone(), sec_value.clone());
+                    }
+                    "workspace" => {
+                        toml_map.insert(sec_key.clone(), sec_value.clone());
+                    }
                     "dependencies" => {
-                        toml_map.insert(sec_key.clone(), sanitize_deps(sec_value.clone()));
+                        toml_map.insert(sec_key.clone(), sanitize_deps(sec_value.clone(), lib_bin));
                     }
                     "dev-dependencies" => {
-                        toml_map.insert(sec_key.clone(), sanitize_deps(sec_value.clone()));
+                        toml_map.insert(sec_key.clone(), sanitize_deps(sec_value.clone(), lib_bin));
                     }
                     "build-dependencies" => {
-                        toml_map.insert(sec_key.clone(), sanitize_deps(sec_value.clone()));
+                        toml_map.insert(sec_key.clone(), sanitize_deps(sec_value.clone(), lib_bin));
                     }
                     "target" => {
 
@@ -180,7 +318,7 @@ fn build_manifest(template_manifest: &Manifest, test_name: &str, lib_bin: LibOrB
                                             for (section_name, props) in sections {
                                                 match section_name.as_str() {
                                                     "dependencies" => {
-                                                        new_sections.insert(section_name, sanitize_deps(props));
+                                                        new_sections.insert(section_name, sanitize_deps(props, lib_bin));
                                                     }
                                                     _ => { }
                                                 }
@@ -253,7 +391,13 @@ fn get_template(test_doc: &DocTest, test: &Test) -> Option<String> {
     }
 }
 
-fn sanitize_deps(toml: Value) -> Value {
+fn sanitize_deps(toml: Value, lib_bin: LibOrBin) -> Value {
+    // Hack: we don't want to run this on the "master_skeptic" project,
+    // and we know that it is the only bin project.
+    if lib_bin == LibOrBin::Bin {
+        return toml;
+    }
+    
     if let Value::Table(deps) = toml {
         let mut new_deps = BTreeMap::new();
 
@@ -267,9 +411,9 @@ fn sanitize_deps(toml: Value) -> Value {
                             let path = PathBuf::from(&prop_value);
                             if !path.is_absolute() {
                                 // rewrite dependency paths to account for the location
-                                // of the test manifest, "tests/skeptic/$test_name/"
+                                // of the test manifest, "tests/skeptic/master_skeptic/$test_name/"
                                 // FIXME: This only works  if the path isn't absolute.
-                                let mut prop_value = format!("../../../{}", prop_value);
+                                let mut prop_value = format!("../../../../{}", prop_value);
                                 new_props.insert(prop_name, Value::String(prop_value));
                             } else {
                                 new_props.insert(prop_name, Value::String(prop_value));
@@ -601,7 +745,8 @@ fn main() {{
 {}
 
     std::process::exit(exit_code);
-}}"#,
+}}
+"#,
              switch_buf,
     );
 
@@ -614,18 +759,27 @@ fn build_supercrate_manifest_template(config: &Config, suite: &DocTestSuite) -> 
 
     {
         let mut deps = BTreeMap::new();
+        let mut workspace_members = vec![];
+        //let mut features = vec![];
         
         for test_doc in &suite.doc_tests {
             for test in &test_doc.tests {
-                if !test.ignore && !test.no_run {
+                if !test.ignore {
                     let mut props = BTreeMap::new();
-                    let path = format!("tests/skeptic/{}", test.name.clone());
+                    let path = format!("{}", test.name.clone());
                     props.insert("path".to_string(), Value::String(path));
-
+                    if test.no_run {
+                        props.insert("optional".to_string(), Value::Boolean(true));
+                    }
                     deps.insert(test.name.clone(), Value::Table(props));
+                    workspace_members.push(Value::String(format!("{}", test.name)));
                 }
             }
         }
+        
+        let mut ws_props = BTreeMap::new();
+        ws_props.insert("members".to_string(), Value::Array(workspace_members));
+        sections.insert("workspace".to_string(), Value::Table(ws_props));
 
         sections.insert("dependencies".to_string(), Value::Table(deps));
     }

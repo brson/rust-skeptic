@@ -4,6 +4,25 @@
 // - resolve a single time, under mutex
 // - run with --locked, -Zoffline
 // - resolve lockfile only when manifest or test docs change
+// - error better when run as a non-build-script
+// - rename root_dir and use concise struct initialization
+// - custom test names
+// - emit comments about which file / line a test came from
+// - fix warnings
+// - add comments
+// - update docs
+// - figure out of test names can be discovered
+// - run tests directly from bins
+// - put all test cases in the supercrate workspace
+// - `cargo update` under mutex, once, run with --locked, -Zoffline
+// - cargo update per rebuild
+// - reduce holding of the build lock
+// - does sharing the project target directory help?
+// - -Zno-update-index
+// - don't comment out ignored tests
+
+
+#![allow(warnings)] // todo
 
 extern crate pulldown_cmark as cmark;
 extern crate tempdir;
@@ -124,13 +143,15 @@ where
     let mut test_file = test_dir.clone();
     test_file.push("skeptic-tests.rs");
 
-    let (target_dir, out_dir_has_triple) = target_dir_from_out_dir(&out_dir, &target_triple);
+    let target_dir_info = target_dir_from_out_dir(&out_dir, &target_triple);
+    let (target_dir, target_exe_dir, out_dir_has_triple) = target_dir_info;
 
     let config = Config {
         root_dir: cargo_manifest_dir,
         test_dir: test_dir,
         test_file: test_file,
         target_dir: target_dir,
+        target_exe_dir: target_exe_dir,
         target_triple: target_triple,
         out_dir_has_triple: out_dir_has_triple,
         cargo: cargo,
@@ -148,7 +169,7 @@ where
 /// - $target_dir/(debug|release)/build/$(root_project_name)-$hash/out/
 /// - $target_dir/$target_triple/(debug|release)/build/$(root_project_name)-$hash/out/
 ///
-fn target_dir_from_out_dir(out_dir: &Path, target_triple: &str) -> (PathBuf, bool) {
+fn target_dir_from_out_dir(out_dir: &Path, target_triple: &str) -> (PathBuf, PathBuf, bool) {
 
     let mut target_dir = out_dir.to_owned();
 
@@ -158,13 +179,14 @@ fn target_dir_from_out_dir(out_dir: &Path, target_triple: &str) -> (PathBuf, boo
     assert!(target_dir.ends_with("build"));
     assert!(target_dir.pop());
     assert!(target_dir.ends_with("debug") || target_dir.ends_with("release"));
+    let target_exe_dir = target_dir.clone();
     assert!(target_dir.pop());
 
     if target_dir.ends_with(target_triple) {
         assert!(target_dir.pop());
-        (target_dir, true)
+        (target_dir, target_exe_dir, true)
     } else {
-        (target_dir, false)
+        (target_dir, target_exe_dir, false)
     }
 }
 
@@ -173,6 +195,7 @@ struct Config {
     test_dir: PathBuf,
     test_file: PathBuf,
     target_dir: PathBuf,
+    target_exe_dir: PathBuf,
     target_triple: String,
     out_dir_has_triple: bool,
     cargo: String,
@@ -181,17 +204,8 @@ struct Config {
 }
 
 fn run(config: &Config) {
-    let tests = extract::extract_tests(config).unwrap();
+    let tests: DocTestSuite = extract::extract_tests(config).unwrap();
     emit::emit_tests(config, tests).unwrap();
-}
-
-struct Test {
-    name: String,
-    text: Vec<String>,
-    ignore: bool,
-    no_run: bool,
-    should_panic: bool,
-    template: Option<String>,
 }
 
 struct DocTestSuite {
@@ -201,9 +215,20 @@ struct DocTestSuite {
 
 struct DocTest {
     path: PathBuf,
+    short_path: PathBuf,
     old_template: Option<String>,
     tests: Vec<Test>,
     templates: HashMap<String, String>,
+}
+
+struct Test {
+    name: String,
+    line: usize,
+    text: Vec<String>,
+    ignore: bool,
+    no_run: bool,
+    should_panic: bool,
+    template: Option<String>,
 }
 
 #[derive(Debug)]

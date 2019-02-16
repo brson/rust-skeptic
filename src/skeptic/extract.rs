@@ -14,9 +14,9 @@ use toml::Value;
 pub (in super) fn extract_tests(config: &Config) -> Result<DocTestSuite, IoError> {
     let mut doc_tests = Vec::new();
     for doc in &config.docs {
-        let path = &mut config.root_dir.clone();
-        path.push(doc);
-        let new_tests = extract_tests_from_file(path)?;
+        let full_path = &mut config.root_dir.clone();
+        full_path.push(doc);
+        let new_tests = extract_tests_from_file(full_path, &PathBuf::from(doc))?;
         doc_tests.push(new_tests);
     }
 
@@ -32,19 +32,20 @@ enum Buffer {
     Header(String),
 }
 
-fn extract_tests_from_file(path: &Path) -> Result<DocTest, IoError> {
-    let mut file = File::open(path)?;
+fn extract_tests_from_file(full_path: &Path, short_path: &Path) -> Result<DocTest, IoError> {
+    let mut file = File::open(full_path)?;
     let s = &mut String::new();
     file.read_to_string(s)?;
 
-    let file_stem = &sanitize_test_name(path.file_stem().unwrap().to_str().unwrap());
+    let file_stem = &sanitize_test_name(short_path.to_str().unwrap());
 
     let tests = extract_tests_from_string(s, file_stem);
 
-    let templates = load_templates(path)?;
+    let templates = load_templates(full_path)?;
 
     Ok(DocTest {
-        path: path.to_owned(),
+        path: full_path.to_owned(),
+        short_path: short_path.to_owned(),
         old_template: tests.1,
         tests: tests.0,
         templates: templates,
@@ -109,6 +110,7 @@ fn extract_tests_from_string(s: &str, file_stem: &str) -> (Vec<Test>, Option<Str
                         };
                         tests.push(Test {
                             name: name,
+                            line: code_block_start,
                             text: buf,
                             ignore: code_block_info.ignore,
                             no_run: code_block_info.no_run,

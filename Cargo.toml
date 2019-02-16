@@ -12,4 +12,3 @@ path = "src/skeptic"
 # It is not needed for normal uses of Skeptic.
 [dependencies.skeptic]
 path = "src/skeptic"
-
